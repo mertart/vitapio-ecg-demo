@@ -6,7 +6,7 @@
  */
 'use strict';
 
-const CACHE = 'vitapio-ecg-v2';
+const CACHE = 'vitapio-ecg-v3';
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 const NETWORK_WAIT_MS = 3000; /* venue Wi-Fi without internet can hang for long */
 

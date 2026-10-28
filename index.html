@@ -379,21 +379,33 @@ async function sendCtrl(cmd, r = 0, ch = 0) {
   await ctrlChar.writeValueWithResponse(pkt);
 }
 
-async function start() {
+const START_RETRY_MS = 2000, START_RETRIES = 20;   // covers the 30 s pairing window
+let startTimer = 0;
+
+async function start(attempt = 0) {
+  clearTimeout(startTimer);
   const s = settings();
   try {
     await sendCtrl(CMD_START, s.rate, s.channels);
     streaming = true;
     $('startStop').textContent = 'Стоп';
     setStatus((SIM ? 'Симуляция' : 'Поток идёт') + (device ? ': ' + device.name : ''), 'ok');
+    if (attempt) setMsg('');
     keepAwake(true);
   } catch (err) {
-    // an unpaired phone gets here if the pairing was not confirmed in time
+    // the device takes commands only over a paired link: while the code waits
+    // for B1 the write fails, so keep asking until the pairing is confirmed
+    if (device && device.gatt.connected && attempt < START_RETRIES) {
+      setMsg('Ждём подтверждения сопряжения: сверьте код на экране устройства, нажмите B1, затем «Связать».');
+      startTimer = setTimeout(() => { if (device && device.gatt.connected && !streaming) start(attempt + 1); }, START_RETRY_MS);
+      return;
+    }
     setMsg('Устройство не приняло команду: ' + err.message + '. Подтвердите сопряжение (B1) и нажмите «Старт».', true);
   }
 }
 
 async function stop() {
+  clearTimeout(startTimer);
   try { await sendCtrl(CMD_STOP); } catch (e) { /* link already gone */ }
   streaming = false;
   $('startStop').textContent = 'Старт';
