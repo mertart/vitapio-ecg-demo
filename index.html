@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#05090a">
+<title>Vitapio ECG</title>
+<!--
+  Live ECG from the Vitapio BLE demo (Nucleo-F401RE + ESP32-C3).
+  Needs Web Bluetooth: Chrome on Android, page served over https or localhost.
+  Packet format: ../common/ecg_proto.h. Add ?sim=1 to run without a device.
+-->
+<style>
+  :root {
+    --bg: #05090a;
+    --panel: #0c1416;
+    --line: #18272a;
+    --text: #d6e4e2;
+    --muted: #7d9491;
+    --trace: #3dff8f;
+    --accent: #3dff8f;
+    --warn: #ffb547;
+    --bad: #ff5d5d;
+    --heart: #ff4f6d;
+    --grid-minor: rgba(61, 255, 143, 0.06);
+    --grid-major: rgba(61, 255, 143, 0.15);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; min-height: 100dvh;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .pill { margin-left: auto; padding: 4px 10px; border-radius: 999px; font-size: 13px; background: var(--panel);
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .pill.ok { color: var(--accent); border-color: rgba(61,255,143,.35); }
+  .pill.wait { color: var(--warn); border-color: rgba(255,181,71,.35); }
+  .pill.bad { color: var(--bad); border-color: rgba(255,93,93,.35); }
+  .sim { color: #111; background: var(--warn); border-radius: 4px; padding: 1px 6px; font-size: 12px; font-weight: 700; }
+
+  .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: var(--line); border-bottom: 1px solid var(--line); }
+  .stat { background: var(--bg); padding: 8px 14px; min-width: 0; }
+  .stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  .stat .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stat .v small { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+  .stat.hr .v { color: var(--heart); }
+  .heart { display: inline-block; transition: transform .12s ease-out; transform-origin: 50% 60%; }
+  .heart.beat { transform: scale(1.35); transition: none; }
+
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  button, select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 14px; min-height: 42px; }
+  button { cursor: pointer; font-weight: 600; }
+  button.primary { background: var(--accent); color: #04140b; border-color: var(--accent); }
+  button:disabled, select:disabled { opacity: .45; cursor: default; }
+  label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .msg { color: var(--muted); font-size: 13px; flex: 1 1 260px; min-width: 0; }
+  .msg.warn { color: var(--warn); }
+
+  .scope { position: relative; flex: 1 1 auto; min-height: 260px; }
+  .scope canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .scale { position: absolute; right: 12px; bottom: 8px; color: var(--muted); font-size: 12px; pointer-events: none; }
+  footer { padding: 6px 16px 10px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+
+  @media (max-width: 640px) {
+    .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .stat.opt { display: none; }
+    .stat .v { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Vitapio <span>· ЭКГ по Bluetooth</span></h1>
+  <span id="simBadge" class="sim" hidden>СИМУЛЯЦИЯ</span>
+  <span id="status" class="pill">Не подключено</span>
+</header>
+
+<section class="stats">
+  <div class="stat hr"><div class="k">Пульс</div><div class="v"><span id="heart" class="heart">♥</span> <span id="bpm">—</span><small>уд/мин</small></div></div>
+  <div class="stat"><div class="k">Поток</div><div class="v"><span id="kbps">0.0</span><small>КБ/с</small></div></div>
+  <div class="stat"><div class="k">Потери</div><div class="v"><span id="loss">0</span><small>%</small></div></div>
+  <div class="stat opt"><div class="k">Пакетов в секунду</div><div class="v" id="pps">0</div></div>
+  <div class="stat opt"><div class="k">Режим</div><div class="v" id="mode">—</div></div>
+</section>
+
+<section class="controls">
+  <button id="connect" class="primary">Подключить</button>
+  <label>Отведения
+    <select id="channels">
+      <option value="1">1</option>
+      <option value="3">3</option>
+      <option value="8" selected>8</option>
+    </select>
+  </label>
+  <label>Частота
+    <select id="rate">
+      <option value="250">250 Гц</option>
+      <option value="500" selected>500 Гц</option>
+      <option value="1000">1000 Гц</option>
+      <option value="2000">2000 Гц</option>
+    </select>
+  </label>
+  <button id="startStop" disabled>Старт</button>
+  <div id="msg" class="msg"></div>
+</section>
+
+<section class="scope" id="scope">
+  <canvas id="grid"></canvas>
+  <canvas id="trace"></canvas>
+  <div class="scale" id="scale"></div>
+</section>
+
+<footer id="footer">Каждое отведение — 24-битные отсчёты. Канал защищён: шифрование BLE и сопряжение с проверкой кода кнопкой на устройстве.</footer>
+
+<script>
+'use strict';
+
+/* ---- protocol (common/ecg_proto.h) --------------------------------------- */
+const SVC  = 'e6c00001-6a3b-4e1f-9d7c-1b2a5f4e3d20';
+const DATA = 'e6c00002-6a3b-4e1f-9d7c-1b2a5f4e3d20';
+const CTRL = 'e6c00003-6a3b-4e1f-9d7c-1b2a5f4e3d20';
+const HDR = 8, SAMPLE = 3, CMD_STOP = 0, CMD_START = 1;
+const LEADS = ['I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6'];
+
+const SIM = new URLSearchParams(location.search).has('sim');
+const $ = id => document.getElementById(id);
+
+/* ---- stream state -------------------------------------------------------- */
+const RING = 1 << 15;            // samples kept per lead, > 12 s at 2000 Hz
+const BUFFER_S = 0.25;           // playout delay that hides BLE bursts
+let rate = 0, channels = 0;
+let ring = [];                   // Float32Array per lead, uV, NaN = lost
+let received = 0;                // next sample index expected
+let total = 0, lost = 0;         // samples
+let playhead = 0, drawn = 0, lastFrame = 0;
+let secBytes = 0, secPackets = 0, secStart = performance.now();
+let streaming = false;
+
+/* heartbeat detection on lead II (or the only lead) */
+let det = null;
+let beatsToShow = [];
+
+function resetStream(newRate, newChannels) {
+  rate = newRate; channels = newChannels;
+  ring = Array.from({ length: channels }, () => new Float32Array(RING).fill(NaN));
+  received = 0; total = 0; lost = 0;
+  playhead = 0; drawn = 0;
+  det = { lead: channels > 1 ? 1 : 0, base: 0, env: 0, cand: -1, candV: -Infinity, last: -1e9, rr: [] };
+  beatsToShow = [];
+  $('bpm').textContent = '—';
+  $('mode').innerHTML = `${channels}×${rate}<small>Гц</small>`;
+  layout();
+}
+
+function onPacket(dv) {
+  if (dv.byteLength < HDR) return;
+  const first = dv.getUint32(0, true), r = dv.getUint16(4, true), ch = dv.getUint8(6), count = dv.getUint8(7);
+  if (dv.byteLength < HDR + count * ch * SAMPLE || ch < 1 || ch > LEADS.length) return;
+
+  // new settings or the device restarted the stream
+  if (r !== rate || ch !== channels || first < received - rate) resetStream(r, ch);
+  if (received === 0 && total === 0) { received = first; playhead = drawn = first; }
+
+  if (first > received) {           // packets lost on the way
+    const gap = first - received;
+    lost += gap;
+    for (let i = received; i < first && i - received < RING; i++)
+      for (let c = 0; c < channels; c++) ring[c][i & (RING - 1)] = NaN;
+  }
+  let off = HDR;
+  for (let i = 0; i < count; i++) {
+    const idx = first + i;
+    for (let c = 0; c < ch; c++, off += SAMPLE) {
+      const v = dv.getUint8(off) | (dv.getUint8(off + 1) << 8) | (dv.getInt8(off + 2) << 16);
+      ring[c][idx & (RING - 1)] = v;
+    }
+    detectBeat(idx, ring[det.lead][idx & (RING - 1)]);
+  }
+  received = Math.max(received, first + count);
+  total += count;
+  secBytes += dv.byteLength; secPackets++;
+}
+
+function detectBeat(idx, v) {
+  const d = det;
+  d.base += (v - d.base) / (rate * 0.6);          // slow baseline
+  const x = v - d.base;
+  d.env = Math.max(d.env * (1 - 1 / (rate * 1.5)), Math.abs(x));
+  const above = x > 0.55 * d.env && idx - d.last > 0.3 * rate;
+  if (above) {
+    if (x > d.candV) { d.candV = x; d.cand = idx; }
+  } else if (d.cand >= 0) {
+    if (d.last > 0) {
+      d.rr.push(d.cand - d.last);
+      if (d.rr.length > 5) d.rr.shift();
+    }
+    d.last = d.cand; d.cand = -1; d.candV = -Infinity;
+    beatsToShow.push(d.last);
+  }
+}
+
+/* ---- drawing ------------------------------------------------------------- */
+const gridCv = $('grid'), traceCv = $('trace');
+const g = gridCv.getContext('2d'), t = traceCv.getContext('2d');
+let W = 0, H = 0, dpr = 1, sweepS = 6, pxPerS = 100, pxPerUv = 0.04, band = 100;
+
+function layout() {
+  const box = $('scope').getBoundingClientRect();
+  dpr = window.devicePixelRatio || 1;
+  W = Math.max(1, Math.floor(box.width)); H = Math.max(1, Math.floor(box.height));
+  for (const cv of [gridCv, traceCv]) { cv.width = W * dpr; cv.height = H * dpr; }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); t.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const n = Math.max(1, channels || 8);
+  band = H / n;
+  sweepS = Math.min(10, Math.max(3, W / 130));     // seconds across the screen
+  pxPerS = W / sweepS;
+  const std = pxPerS / 25 * 10 / 1000;             // 25 mm/s and 10 mm/mV, in px per uV
+  pxPerUv = Math.min(std, band / 3200);            // keep about 3.2 mV per lead
+  $('scale').textContent = pxPerUv < std * 0.99
+    ? `25 мм/с · ${Math.round(pxPerUv / std * 10)} мм/мВ`
+    : '25 мм/с · 10 мм/мВ';
+  drawGrid(n);
+  t.clearRect(0, 0, W, H);
+  drawn = Math.floor(playhead);
+}
+
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+let traceColor = '#3dff8f';
+
+function drawGrid(n) {
+  g.fillStyle = cssVar('--bg'); g.fillRect(0, 0, W, H);
+  // ECG paper: 1 mm = 0.04 s across; vertical boxes the same size
+  const minor = pxPerS * 0.04, major = pxPerS * 0.2;
+  const lines = (step, color) => {
+    g.strokeStyle = color; g.lineWidth = 1; g.beginPath();
+    for (let x = 0; x <= W; x += step) { g.moveTo(Math.round(x) + .5, 0); g.lineTo(Math.round(x) + .5, H); }
+    for (let y = 0; y <= H; y += step) { g.moveTo(0, Math.round(y) + .5); g.lineTo(W, Math.round(y) + .5); }
+    g.stroke();
+  };
+  if (minor >= 4) lines(minor, cssVar('--grid-minor'));
+  lines(major, cssVar('--grid-major'));
+  g.fillStyle = cssVar('--muted'); g.font = '600 13px system-ui, sans-serif';
+  for (let i = 0; i < n; i++) g.fillText(channels ? LEADS[i] : '', 8, band * i + 18);
+  traceColor = cssVar('--trace');
+}
+
+const xOf = idx => ((idx % (rate * sweepS)) / (rate * sweepS)) * W;
+const yOf = (lead, uv) => band * (lead + 0.5) - uv * pxPerUv;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - (lastFrame || now)) / 1000);
+  lastFrame = now;
+  if (now - secStart >= 1000) updateStats(now);
+  if (!rate || received === 0) return;
+
+  // play back at the sample rate, a little behind what has arrived
+  const target = received - rate * BUFFER_S;
+  playhead += dt * rate;
+  if (received - playhead > rate * 1.5) playhead = target;   // fell far behind: jump
+  playhead += (target - playhead) * 0.02;                     // follow clock drift
+  playhead = Math.min(playhead, received);
+  const to = Math.floor(playhead);
+  if (to <= drawn) return;
+
+  const span = Math.floor(rate * sweepS);
+  if (to - drawn > span) { drawn = to - span; t.clearRect(0, 0, W, H); }
+  t.strokeStyle = traceColor; t.lineWidth = 1.6; t.lineJoin = 'round';
+  for (let c = 0; c < channels; c++) {
+    const buf = ring[c];
+    t.beginPath();
+    let pen = false, px = -1;
+    for (let i = drawn; i <= to; i++) {
+      const v = buf[i & (RING - 1)], x = xOf(i);
+      if (Number.isNaN(v) || x < px) { pen = false; }   // lost data or wrapped to the left edge
+      if (!Number.isNaN(v)) {
+        const y = yOf(c, v);
+        if (pen) t.lineTo(x, y); else { t.moveTo(x, y); pen = true; }
+      }
+      px = x;
+    }
+    t.stroke();
+  }
+  drawn = to;
+
+  // erase a strip ahead of the cursor, like a monitor sweep
+  const x = xOf(to), gap = Math.max(12, W * 0.03);
+  t.clearRect(x + 2, 0, gap, H);
+  if (x + 2 + gap > W) t.clearRect(0, 0, x + 2 + gap - W, H);
+
+  while (beatsToShow.length && beatsToShow[0] <= to) { beatsToShow.shift(); pulse(); }
+}
+
+function pulse() {
+  const h = $('heart');
+  h.classList.add('beat');
+  setTimeout(() => h.classList.remove('beat'), 110);
+  const rr = det.rr;
+  if (rr.length >= 2) {
+    const s = [...rr].sort((a, b) => a - b);
+    $('bpm').textContent = Math.round(60 * rate / s[s.length >> 1]);
+  }
+}
+
+function updateStats(now) {
+  const s = (now - secStart) / 1000;
+  $('kbps').textContent = (secBytes / 1000 / s).toFixed(1);
+  $('pps').textContent = Math.round(secPackets / s);
+  const pct = total + lost ? (100 * lost / (total + lost)) : 0;
+  $('loss').textContent = pct < 0.1 ? pct.toFixed(pct ? 2 : 0) : pct.toFixed(1);
+  secBytes = 0; secPackets = 0; secStart = now;
+}
+
+/* ---- BLE ----------------------------------------------------------------- */
+let device = null, ctrlChar = null, dataChar = null;
+
+function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = 'pill' + (cls ? ' ' + cls : ''); }
+function setMsg(text, warn) { const m = $('msg'); m.textContent = text || ''; m.className = 'msg' + (warn ? ' warn' : ''); }
+
+function settings() { return { rate: +$('rate').value, channels: +$('channels').value }; }
+
+async function connect() {
+  if (SIM) return simConnect();
+  if (!navigator.bluetooth) {
+    setMsg(window.isSecureContext
+      ? 'Этот браузер не умеет Web Bluetooth. Откройте страницу в Chrome на Android.'
+      : `Web Bluetooth работает только на https:// или localhost. Для этого адреса: chrome://flags/#unsafely-treat-insecure-origin-as-secure → Enabled → впишите ${location.origin} → Relaunch.`, true);
+    return;
+  }
+  try {
+    setStatus('Выбор устройства…', 'wait');
+    try {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'Vitapio' }], optionalServices: [SVC] });
+    } catch (err) {
+      setStatus('Не подключено'); setMsg(err.name === 'NotFoundError' ? '' : err.message, err.name !== 'NotFoundError');
+      return;
+    }
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    setStatus('Подключение…', 'wait');
+    setMsg('Если устройство новое: сверьте код на телефоне и на экране устройства, нажмите B1, затем «Связать».');
+    const server = await device.gatt.connect();
+    let svc;
+    try {
+      svc = await server.getPrimaryService(SVC);
+    } catch (err) {
+      // Android keeps the service list of a paired device from its last pairing
+      throw new Error(`${device.name} не показал сервис ЭКГ. Если прошивку обновляли: удалите ${device.name} в настройках Bluetooth, удерживайте B1 3 с и подключитесь заново`);
+    }
+    dataChar = await svc.getCharacteristic(DATA);
+    ctrlChar = await svc.getCharacteristic(CTRL);
+    dataChar.addEventListener('characteristicvaluechanged', e => onPacket(e.target.value));
+    await dataChar.startNotifications();
+    setStatus('Подключено: ' + device.name, 'ok');
+    setMsg('');
+    $('connect').textContent = 'Отключить';
+    $('connect').classList.remove('primary');
+    $('startStop').disabled = false;
+    await start();
+  } catch (err) {
+    if (device) {
+      device.removeEventListener('gattserverdisconnected', onDisconnected); // keep this message
+      if (device.gatt.connected) device.gatt.disconnect();
+    }
+    onDisconnected();
+    setStatus('Ошибка', 'bad');
+    setMsg(err.message, true);
+  }
+}
+
+async function sendCtrl(cmd, r = 0, ch = 0) {
+  const pkt = new Uint8Array([cmd, r & 0xff, r >> 8, ch]);
+  if (SIM) return simCtrl(pkt);
+  await ctrlChar.writeValueWithResponse(pkt);
+}
+
+async function start() {
+  const s = settings();
+  try {
+    await sendCtrl(CMD_START, s.rate, s.channels);
+    streaming = true;
+    $('startStop').textContent = 'Стоп';
+    setStatus((SIM ? 'Симуляция' : 'Поток идёт') + (device ? ': ' + device.name : ''), 'ok');
+    keepAwake(true);
+  } catch (err) {
+    // an unpaired phone gets here if the pairing was not confirmed in time
+    setMsg('Устройство не приняло команду: ' + err.message + '. Подтвердите сопряжение (B1) и нажмите «Старт».', true);
+  }
+}
+
+async function stop() {
+  try { await sendCtrl(CMD_STOP); } catch (e) { /* link already gone */ }
+  streaming = false;
+  $('startStop').textContent = 'Старт';
+  if (device) setStatus('Подключено: ' + device.name, 'ok');
+  keepAwake(false);
+}
+
+function onDisconnected() {
+  streaming = false;
+  ctrlChar = dataChar = null;
+  setStatus('Отключено', 'bad');
+  setMsg('Связь потеряна. Нажмите «Подключить».', true);
+  $('connect').textContent = 'Подключить';
+  $('connect').classList.add('primary');
+  $('startStop').disabled = true;
+  $('startStop').textContent = 'Старт';
+  keepAwake(false);
+}
+
+$('connect').addEventListener('click', () => {
+  if (SIM) return simConnected ? simDisconnect() : connect();
+  if (device && device.gatt.connected) { stop().finally(() => device.gatt.disconnect()); } else connect();
+});
+$('startStop').addEventListener('click', () => streaming ? stop() : start());
+for (const id of ['rate', 'channels']) $(id).addEventListener('change', () => { if (streaming) start(); });
+
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wakeLock && navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen');
+    if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) { /* not important */ }
+}
+
+/* ---- simulation: the same generator as the STM32 (ecg_synth.c) ----------- */
+let simConnected = false, simTimer = 0;
+const sim = { rate: 0, ch: 0, frame: 0, t: 0, rr: 0.83, breath: 0, rDone: false, start: 0 };
+const WT = [0.150, 0.325, 0.350, 0.375, 0.600], WW = [0.025, 0.010, 0.012, 0.010, 0.045];
+const AMP = [[100, -50, 800, -100, 250], [150, -100, 1200, -250, 350], [80, 0, 300, -1000, -100], [100, 0, 600, -1200, 400],
+             [100, -50, 900, -800, 450], [100, -100, 1400, -500, 450], [100, -100, 1300, -300, 350], [100, -100, 1000, -150, 300]];
+const WANDER = [40, 60, 30, 50, 70, 80, 60, 50];
+
+function simNextRr() { return 60 / (72 + 4 * Math.sin(2 * Math.PI * sim.breath) + (Math.random() * 2 - 1)); }
+function simSample(out) {
+  const gs = WT.map((c, w) => { const x = (sim.t - c) / WW[w]; return Math.abs(x) < 6 ? Math.exp(-0.5 * x * x) : 0; });
+  const br = Math.sin(2 * Math.PI * sim.breath);
+  for (let l = 0; l < 8; l++) out[l] = Math.round(WANDER[l] * br + 8 * (Math.random() * 2 - 1) + AMP[l].reduce((a, k, w) => a + k * gs[w], 0));
+  const dt = 1 / sim.rate;
+  sim.t += dt; if (sim.t >= sim.rr) { sim.t -= sim.rr; sim.rr = simNextRr(); }
+  sim.breath = (sim.breath + 0.25 * dt) % 1;
+}
+function simCtrl(pkt) {
+  clearInterval(simTimer);
+  if (pkt[0] !== CMD_START) return;
+  Object.assign(sim, { rate: pkt[1] | (pkt[2] << 8), ch: pkt[3], frame: 0, t: 0, breath: 0, start: performance.now() });
+  sim.rr = simNextRr();
+  const perPkt = Math.min(Math.floor((244 - HDR) / (sim.ch * SAMPLE)), Math.floor(sim.rate * 0.04));
+  const out = new Array(8);
+  simTimer = setInterval(() => {
+    const due = Math.floor((performance.now() - sim.start) / 1000 * sim.rate);
+    while (due - sim.frame >= perPkt) {
+      const buf = new DataView(new ArrayBuffer(HDR + perPkt * sim.ch * SAMPLE));
+      buf.setUint32(0, sim.frame, true); buf.setUint16(4, sim.rate, true); buf.setUint8(6, sim.ch); buf.setUint8(7, perPkt);
+      let off = HDR;
+      for (let i = 0; i < perPkt; i++) {
+        simSample(out);
+        for (let c = 0; c < sim.ch; c++, off += 3) { const v = out[c] & 0xffffff; buf.setUint8(off, v & 0xff); buf.setUint8(off + 1, (v >> 8) & 0xff); buf.setUint8(off + 2, v >> 16); }
+      }
+      sim.frame += perPkt;
+      onPacket(buf);
+    }
+  }, 20);
+}
+function simConnect() {
+  simConnected = true; device = { name: 'Vitapio-SIM' };
+  $('connect').textContent = 'Отключить'; $('connect').classList.remove('primary');
+  $('startStop').disabled = false;
+  start();
+}
+function simDisconnect() { clearInterval(simTimer); simConnected = false; device = null; onDisconnected(); setMsg(''); }
+
+/* ---- start --------------------------------------------------------------- */
+if (SIM) { $('simBadge').hidden = false; setMsg('Данные генерирует сама страница, устройство не нужно.'); }
+window.addEventListener('resize', layout);
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
